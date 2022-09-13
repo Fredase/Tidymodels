@@ -1,0 +1,297 @@
+---
+title: "Tidymodels Project"
+author: "Ikechukwu Fredrick Okorie"
+date: "2022-09-07"
+output: html_document
+---
+
+# **TIDYMODELS PROJECT**
+
+For this project we will consider the consumer complaints data from [Consumer Complaint Database](https://www.consumerfinance.gov/data-research/consumer-complaints/) (CFPB). The CFPB is an independent agency of the United States government that promotes transparency and protects consumers by providing information needed to make decisions when choosing financial institutions including banking institutions, lenders, mortgage services, credit unions, securities firms, foreclosure services, and debt collectors. One of the purposes of the agency is to receive and process complaints and questions about consumer financial products and services.
+
+When a complaint is submitted by a consumer, the CFPB has to determine which category the complaint falls in (e.g. "Mortgage", "Student loan", etc).In this project, the goal will be to use the skills you have learned about in this course to build a classification algorithm to classify consumer complaints into one of four categories: "Credit card or prepaid card", "Mortgage", "Student loan", or "Vehicle loan or lease".
+
+
+
+## **LOAD THE REQUIRED LIBRARIES**
+```{r setup, include=TRUE}
+library(tidymodels)
+library(tidyverse)
+library(visdat)
+library(skimr)
+library(tidytext)
+library(tidylo)
+library(textrecipes)
+library(themis)
+library(doParallel)
+library(stopwords)
+
+```
+## **LOAD OUR DATA**
+```{r Load_data, include=TRUE, echo=TRUE}
+## Load the data
+train_data <- read_csv("data_complaints_train.csv")
+test_data <- read.csv("data_complaints_test.csv")
+```
+## **EXPLORE THE TRAIN DATA**
+```{r inv_data1, include=TRUE, echo=TRUE}
+## Check dimension of your data
+dim(train_data)
+dim(test_data)
+```
+```{r inv_data2, include=TRUE, echo=TRUE}
+## view the train data
+train_data %>% glimpse()
+```
+```{r inv_data3, include=TRUE, echo=TRUE}
+## Inspect the target variable
+table(train_data$Product)
+```
+```{r inv_data4, include=TRUE, echo=TRUE}
+## visualize data structure
+vis_dat(train_data)
+```
+```{r inv_data5, include=TRUE, echo=TRUE}
+## visualize missing values
+vis_miss(train_data)
+```
+We can see from the plot of the data structure and that of missing values of our training dataset that there are no missing values.
+
+Next, as part of our data wrangling process we want to know the distinct values in some of our independent variables
+```{r inv_data6, include=TRUE, echo=TRUE}
+## Number of unique values in State, Company, and Submitted columns
+train_data %>% select(State) %>% n_distinct()
+train_data %>% select(Company) %>% n_distinct()
+train_data %>% select(`Submitted via`) %>% n_distinct()
+```
+Lets look at Consumer Complaints Narrative column for more context
+```{r inv_data7, include=TRUE, echo=TRUE}
+## Lets look at the consumer complaints narrative column
+head(train_data$`Consumer complaint narrative`)
+```
+The complaint narratives contain many series of "x"’s meant to protect personally
+Identifiable information (PII)
+
+Next we convert all the variables to factor, except the CCN column
+```{r inv_data8, include=TRUE, echo=TRUE}
+train_data <- train_data %>% 
+  mutate(across(c(Product, Company, State, `ZIP code`, `Submitted via`), as.factor))
+
+## Confirm change
+train_data %>% glimpse()
+```
+```{r inv_data9, include=TRUE, echo=TRUE}
+## Obtain summary statistics of our training set
+skim(train_data)
+```
+Next we visualize our target variable
+```{r target_plot, include=TRUE, echo=TRUE}
+## Visualize target variable
+train_data %>% ggplot(aes(Product)) + geom_bar()
+```
+There are more complaints related to "Credit card or prepaid card" than "Student loan" and "Vehicle loan or lease" combined. "Mortgage" is second.
+
+## **A LOOK AT THE CONSUMER COMPLAINTS NARRATIVE TEXT**
+Here we look at the text in the CCN column to make better sense of it and how it relates to our target variable (Product)
+```{r exp_ccn, include=TRUE, echo=TRUE}
+narrative_count <- train_data %>% 
+  unnest_tokens(word, `Consumer complaint narrative`) %>% 
+  count(Product, word, sort = TRUE) %>% bind_log_odds(Product, word, n)
+
+narrative_count %>% head()
+```
+From the above we see the how each word helps to determine which _Product_ the complaint narrative is about. We can render this in a plot to know the 15 most used words for each product
+
+```{r ccn_plot, include=TRUE, echo=TRUE}
+## Visualize narrative count by product
+narrative_count %>% group_by(Product) %>% 
+  slice_max(log_odds_weighted, n =15) %>% 
+  ungroup() %>% ggplot(aes(log_odds_weighted, fct_reorder(word,log_odds_weighted),
+                           fill = Product)) + geom_col(show.legend = FALSE) +
+  facet_wrap(vars(Product), scales = "free_y") +
+  labs(x = "Log adds (weighted)", y = NULL)
+```
+## **SPLIT OUR TRAINING DATASET**
+```{r data_split, include=TRUE, echo=TRUE}
+set.seed(1234)
+first_split <- initial_split(train_data, strata = Product) ## split 3/4 ratio
+first_train <- training(first_split)
+first_test <- testing(first_split)
+
+## check dimension of our split data
+first_train %>% nrow()
+first_test %>% nrow()
+```
+
+## **CREATE FOLDS FOR CROSS VALIDATION**
+Here we randomly split of _first_train_ data into v groups of roughly equal size
+```{r vfold, include=TRUE, echo=TRUE}
+## Create folds
+target_fold <- vfold_cv(first_train, strata = Product)
+
+target_fold
+```
+
+## **CREATE RECIPES AND FEATURE ENGINEERING**
+```{r recipe, include=TRUE, echo=TRUE}
+my_rec <- recipe(Product ~ Company + `ZIP code` + State + `Consumer complaint narrative`,
+                 data = first_train) %>%
+  # mitigate imbalance by making levels equal
+  themis::step_downsample(Product) %>%
+  # convert character predictor (Narrative) into a token variable
+  step_tokenize(`Consumer complaint narrative`) %>%
+  # remove stop words
+  step_stopwords(`Consumer complaint narrative`) %>%
+  # stem tokens
+  step_stem(`Consumer complaint narrative`) %>%
+  # keep only top 250 max_tokens
+  textrecipes::step_tokenfilter(`Consumer complaint narrative`, max_tokens = 250) %>%
+  # "step_tfidf creates a specification of a recipe step that will convert 
+  #  a token variable into multiple variables containing the term 
+  #  frequency-inverse document frequency of tokens."
+  textrecipes::step_tfidf(`Consumer complaint narrative`) %>%
+  # convert factors to numeric (dummy)
+  step_dummy(all_nominal_predictors())
+
+my_rec
+```
+## **CREATE MODEL**
+We will use a Lasso model, since we have a few words or tokens the CCN column that influence the target variable (Product). Lasso will drop 'insignificant' predictors
+```{r model1, include=TRUE, echo=TRUE}
+model <- parsnip::multinom_reg(penalty = tune(), mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+model
+```
+## **CREATE WORKFLOW**
+```{r wf, include=TRUE, echo=TRUE}
+rec_wf <- workflow(my_rec, model)
+
+rec_wf
+```
+## **CREATE AND REVIEW TUNING PARAMETERS**
+```{r tune, include=TRUE, echo=TRUE}
+# create a grid to tune the 'penalty' parameter
+model_grid <- grid_regular(penalty(range(c(-5,0))), levels =20)
+
+registerDoParallel()
+
+set.seed(289)
+
+target_tune <- tune_grid(rec_wf, target_fold, grid = model_grid)
+
+target_tune
+```
+```{r tune_plot, include=TRUE, echo=TRUE}
+## plot results
+autoplot(target_tune)
+```
+```{r show_hyper, include=TRUE, echo=TRUE}
+# display best sets of hyperparameters based on accuracy and area under the curve
+show_best(target_tune, metric = "accuracy")
+
+show_best(target_tune, metric = "roc_auc")
+```
+```{r select_hyper, include=TRUE, echo=TRUE}
+## Select best model based on some metrics
+select_best(target_tune, metric = "accuracy")
+
+select_best(target_tune, metric = "roc_auc")
+```
+Although we have found the **‘best’** set of hyperparmanters using select_best(), we can get a simpler model by selecting a model within one standard error of the best model using select_by_one_std_err() after sorting the penalties in descending order.
+
+```{r simple_hyper, include=TRUE, echo=TRUE}
+## select the best performing hyperparameter based on one standard error
+best_hyper <- target_tune %>%
+  select_by_one_std_err(metric = "roc_auc", desc(penalty))
+
+best_hyper
+```
+Now with our best hyperparameter set, we update our model
+## **UPDATE OUR MODEL**
+
+```{r update_model, include=TRUE, echo=TRUE}
+## determine the best model using finalize_workflow()
+final_model <- rec_wf %>% 
+  finalize_workflow(best_hyper) %>% last_fit(first_split)
+
+final_model
+```
+## **EVALUATE MODEL PERFORMANCE**
+As this is a classification model our metrics will be _accuracy_ and _roc (Area under the curve)_
+```{r eval_model, include=TRUE, echo=TRUE}
+# extract statistics
+collect_metrics(final_model)
+```
+```{r conf_mtx, include=TRUE, echo=TRUE}
+# review confusion matrix
+confusion_matrix <- collect_predictions(final_model) %>%
+  conf_mat(Product, .pred_class)
+
+confusion_matrix
+```
+```{r mtx_plot, include=TRUE, echo=TRUE}
+# plot confusion matrix as heatmap
+autoplot(confusion_matrix, type = "heatmap")
+```
+With an accuracy of 96.7% and ROC of 99.7% our model is performing excellently well. The estimated error rate is 3.30%
+
+## **PLOT ROC FOR EACH OF THE PREDICTIONS**
+Lets plot a ROC curve to better visualize how well our model does predicting the target classes
+```{r auc_plot, include=TRUE, echo=TRUE}
+collect_predictions(final_model) %>%
+  roc_curve(truth = Product, 
+            `.pred_Credit card or prepaid card` : `.pred_Vehicle loan or lease`) %>%
+  #            .pred_Mortgage:.pred_Mortgage) %>%
+  ggplot(aes(1 - specificity, 
+             sensitivity, 
+             color = .level)) +
+  geom_abline(slope = 1, 
+              color = "gray50", 
+              lty = 2, 
+              alpha = 0.8) +
+  geom_path(size = 1.5, 
+            alhpa = 0.7) +
+  labs(color = NULL) +
+  coord_fixed()
+```
+The roc curve supports the results shown in the confusion matrix. ‘Student loan’ was the best predicted target and ‘Vehicle loan or lease’ was the worst predicted, but all came close to an auc equal to 1.
+
+## **FIT MODEL FOR PRODUCTION**
+```{r fit_prod, include=TRUE, echo=TRUE}
+prod_fit <- extract_workflow(final_model)
+
+prod_fit
+```
+## **A LOOK AT OUR TEST DATA**
+Now we make predictions with our model on unseen data. But first we have to ensure that our test data is in the right format or is compatible with our model
+
+```{r test, include=TRUE, echo=TRUE}
+glimpse(test_data)
+```
+```{r test1, include=TRUE, echo=TRUE}
+colnames(test_data)
+```
+There are inconsistencies with the variable names so we have to correct that
+```{r test2, include=TRUE, echo=TRUE}
+test_data <- test_data %>% rename("Consumer complaint narrative" = "Consumer.complaint.narrative",
+                                  "ZIP code" = "ZIP.code", "Submitted via" = "Submitted.via")
+```
+## **MAKE PREDICTION WITH TEST DATA**
+```{r test3, include=TRUE, echo=TRUE}
+#Get the class label predictions
+class_pred <- predict(prod_fit, test_data)
+
+#Get the probability predictions
+prob_pred <- predict(prod_fit, test_data, type="prob") 
+
+#Combined into tibble and rename
+predictions <- data.frame(class_pred, prob_pred) %>% 
+  setNames(c("Class", "Credit_Card_pred", "Mortgage_pred",
+             "Student_loan_pred", "Vehicle_loan_pred"))
+
+predictions
+```
+
+
